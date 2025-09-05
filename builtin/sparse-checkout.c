@@ -2,6 +2,7 @@
 #define DISABLE_SIGN_COMPARE_WARNINGS
 
 #include "builtin.h"
+#include "abspath.h"
 #include "config.h"
 #include "dir.h"
 #include "environment.h"
@@ -23,7 +24,7 @@
 static const char *empty_base = "";
 
 static char const * const builtin_sparse_checkout_usage[] = {
-	N_("git sparse-checkout (init | list | set | add | reapply | disable | check-rules) [<options>]"),
+	N_("git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]"),
 	NULL
 };
 
@@ -920,6 +921,111 @@ static int sparse_checkout_reapply(int argc, const char **argv,
 	return update_working_directory(NULL);
 }
 
+static char const * const builtin_sparse_checkout_clean_usage[] = {
+	"git sparse-checkout clean [-n|--dry-run]",
+	NULL
+};
+
+static int list_file_iterator(const char *path, const void *data)
+{
+	const char *msg = data;
+
+	printf(msg, path);
+	return 0;
+}
+
+static void list_every_file_in_dir(const char *msg,
+				   const char *directory)
+{
+	struct strbuf path = STRBUF_INIT;
+
+	strbuf_addstr(&path, directory);
+	fprintf(stderr, "list every file in %s\n", directory);
+
+	for_each_file_in_dir(&path, list_file_iterator, msg);
+	strbuf_release(&path);
+}
+
+static const char *msg_remove = N_("Removing %s\n");
+static const char *msg_would_remove = N_("Would remove %s\n");
+
+static int sparse_checkout_clean(int argc, const char **argv,
+				   const char *prefix,
+				   struct repository *repo)
+{
+	struct strbuf full_path = STRBUF_INIT;
+	const char *msg = msg_remove;
+	size_t worktree_len;
+	int force = 0, dry_run = 0, verbose = 0;
+	int require_force = 1;
+	struct unpack_trees_options o = { 0 };
+
+	struct option builtin_sparse_checkout_clean_options[] = {
+		OPT__DRY_RUN(&dry_run, N_("dry run")),
+		OPT__FORCE(&force, N_("force"), PARSE_OPT_NOCOMPLETE),
+		OPT__VERBOSE(&verbose, N_("report each affected file, not just directories")),
+		OPT_END(),
+	};
+
+	setup_work_tree();
+	if (!core_apply_sparse_checkout)
+		die(_("must be in a sparse-checkout to clean directories"));
+	if (!core_sparse_checkout_cone)
+		die(_("must be in a cone-mode sparse-checkout to clean directories"));
+
+	argc = parse_options(argc, argv, prefix,
+			     builtin_sparse_checkout_clean_options,
+			     builtin_sparse_checkout_clean_usage, 0);
+
+	repo_config_get_bool(repo, "clean.requireforce", &require_force);
+	if (require_force && !force && !dry_run)
+		die(_("for safety, refusing to clean without one of --force or --dry-run"));
+
+	if (dry_run)
+		msg = msg_would_remove;
+
+	if (repo_read_index(repo) < 0)
+		die(_("failed to read index"));
+
+	o.verbose_update = verbose;
+	o.update = 0; /* skip modifying the worktree here. */
+	o.head_idx = -1;
+	o.src_index = o.dst_index = repo->index;
+	if (update_sparsity(&o, NULL))
+		warning(_("failed to reapply sparse-checkout patterns"));
+
+	if (convert_to_sparse(repo->index, SPARSE_INDEX_MEMORY_ONLY) ||
+	    repo->index->sparse_index == INDEX_EXPANDED)
+		die(_("failed to convert index to a sparse index; resolve merge conflicts and try again"));
+
+	strbuf_addstr(&full_path, repo->worktree);
+	strbuf_addch(&full_path, '/');
+	worktree_len = full_path.len;
+
+	for (size_t i = 0; i < repo->index->cache_nr; i++) {
+		struct cache_entry *ce = repo->index->cache[i];
+		if (!S_ISSPARSEDIR(ce->ce_mode))
+			continue;
+		strbuf_setlen(&full_path, worktree_len);
+		strbuf_add(&full_path, ce->name, ce->ce_namelen);
+
+		if (!is_directory(full_path.buf))
+			continue;
+
+		if (verbose)
+			list_every_file_in_dir(msg, ce->name);
+		else
+			printf(msg, ce->name);
+
+		if (dry_run <= 0 &&
+		    remove_dir_recursively(&full_path, 0))
+			warning_errno(_("failed to remove '%s'"), ce->name);
+	}
+
+	strbuf_release(&full_path);
+	return 0;
+}
+
 static char const * const builtin_sparse_checkout_disable_usage[] = {
 	"git sparse-checkout disable",
 	NULL
@@ -1073,6 +1179,7 @@ int cmd_sparse_checkout(int argc,
 		OPT_SUBCOMMAND("set", &fn, sparse_checkout_set),
 		OPT_SUBCOMMAND("add", &fn, sparse_checkout_add),
 		OPT_SUBCOMMAND("reapply", &fn, sparse_checkout_reapply),
+		OPT_SUBCOMMAND("clean", &fn, sparse_checkout_clean),
 		OPT_SUBCOMMAND("disable", &fn, sparse_checkout_disable),
 		OPT_SUBCOMMAND("check-rules", &fn, sparse_checkout_check_rules),
 		OPT_END(),
